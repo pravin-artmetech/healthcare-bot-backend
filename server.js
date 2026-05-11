@@ -1,27 +1,35 @@
 /**
- * HealthcareBot — Daily India Health Updates Aggregator
- * ------------------------------------------------------
- * Fetches the top 10 health-sector updates each day from
- * verified Indian government and accredited sources.
+ * HealthcareBot — Daily India Health Updates Aggregator (v2)
+ * ----------------------------------------------------------
+ * Fetches the top 10 India-relevant healthcare stories each day,
+ * enriches them with live trend signals (Google Trends India),
+ * and uses Claude to apply Apollo Hospitals' brand lens —
+ * producing ready-to-execute marketing content angles per story.
  *
- * Trusted source whitelist (only these are ever ingested):
- *   - MoHFW          (mohfw.gov.in)        — Union Health Ministry
- *   - PIB            (pib.gov.in)          — Press Information Bureau
- *   - ICMR           (icmr.gov.in)         — Indian Council of Medical Research
- *   - AIIMS          (aiims.edu)
- *   - NHA / ABDM     (abdm.gov.in)         — Ayushman Bharat Digital Mission
- *   - CDSCO          (cdsco.gov.in)        — Drug regulator
- *   - DD News Health (ddnews.gov.in)
- *   - Medical Dialogues (peer-reviewed clinical news)
+ * Trusted source whitelist (only these are ingested):
+ *   - MoHFW, PIB Health, ICMR, AIIMS, CDSCO, NHA/ABDM,
+ *     DD News Health, Medical Dialogues
+ *
+ * Cross-reference (corroboration only, never sole source):
+ *   - WHO SEARO, IDSP weekly bulletins, NCDC, State Health Depts,
+ *     The Lancet Regional Health – SEA, AIIMS press releases
  *
  * Usage:
- *   1. npm install node-cron rss-parser axios cheerio express cors openai
- *   2. Set OPENAI_API_KEY (or ANTHROPIC_API_KEY) in .env for summarisation
+ *   1. npm install node-cron rss-parser axios cheerio express cors \
+ *        @anthropic-ai/sdk google-trends-api dotenv
+ *   2. Add to .env:
+ *        ANTHROPIC_API_KEY=sk-ant-...
+ *        PORT=3000
  *   3. node server.js
- *   4. Frontend hits GET /api/today  → returns 10 curated stories
+ *   4. Frontend hits:
+ *        GET /api/today    → 10 curated stories with Apollo angles
+ *        GET /api/refresh  → force rebuild
+ *        GET /health       → liveness check
  *
- * Schedule: runs daily at 06:30 IST (cron: 30 1 * * *  UTC)
+ * Schedule: daily 06:30 IST = 01:00 UTC
  */
+
+require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
@@ -31,11 +39,17 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const fs = require('fs').promises;
 const path = require('path');
+const Anthropic = require('@anthropic-ai/sdk');
+const googleTrends = require('google-trends-api');
 
 const parser = new Parser({
   timeout: 15000,
-  headers: { 'User-Agent': 'HealthcareBot/1.0 (Artmetech; news-aggregator)' }
+  headers: { 'User-Agent': 'HealthcareBot/2.0 (Artmetech; Apollo-marketing)' }
 });
+
+const anthropic = process.env.ANTHROPIC_API_KEY
+  ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+  : null;
 
 // =============== TRUSTED SOURCES ===============
 const SOURCES = [
@@ -86,16 +100,19 @@ const SOURCES = [
   }
 ];
 
+const TRUSTED_SOURCE_NAMES = SOURCES.map(s => s.name);
+
 // =============== KEYWORD FILTER (India-relevant) ===============
 const INDIA_KEYWORDS = [
   'india', 'indian', 'mohfw', 'icmr', 'aiims', 'cdsco', 'ayushman',
   'pmjay', 'abdm', 'nha', 'state govt', 'delhi', 'mumbai', 'bengaluru',
+  'chennai', 'kolkata', 'hyderabad', 'kerala', 'maharashtra', 'karnataka',
   'modi', 'health minister', 'union health', 'niti aayog'
 ];
 
 // =============== KEYWORD → CATEGORY MAP ===============
 const CATEGORY_RULES = [
-  { keys: ['outbreak', 'alert', 'virus', 'surveillance', 'epidemic'], cat: 'alert', label: 'Health Alert' },
+  { keys: ['outbreak', 'alert', 'virus', 'surveillance', 'epidemic'], cat: 'alert',    label: 'Health Alert' },
   { keys: ['ai', 'digital', 'telemedicine', 'app', 'platform'],       cat: 'tech',     label: 'Health Tech' },
   { keys: ['drug', 'pharma', 'vaccine', 'api', 'cdsco'],              cat: 'pharma',   label: 'Pharma' },
   { keys: ['research', 'icmr', 'study', 'trial', 'clinical'],         cat: 'research', label: 'Research' },
@@ -133,7 +150,7 @@ async function fetchScrape(source) {
   try {
     const { data } = await axios.get(source.url, {
       timeout: 15000,
-      headers: { 'User-Agent': 'HealthcareBot/1.0 (Artmetech)' }
+      headers: { 'User-Agent': 'HealthcareBot/2.0 (Artmetech)' }
     });
     const $ = cheerio.load(data);
     const items = [];
@@ -162,11 +179,72 @@ function stripHtml(html) {
   return html.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
 }
 
+// =============== GOOGLE TRENDS (India geo) ===============
+/**
+ * Fetch 7-day interest-over-time for a keyword in India.
+ * Returns { score: 0-100, status: rising|peaked|declining|dormant, sampledAt }.
+ * Falls back gracefully if the unofficial API rate-limits us.
+ */
+async function fetchGoogleTrendIndia(keyword) {
+  try {
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const raw = await googleTrends.interestOverTime({
+      keyword,
+      startTime: sevenDaysAgo,
+      geo: 'IN'
+    });
+    const parsed = JSON.parse(raw);
+    const timeline = parsed?.default?.timelineData || [];
+    if (!timeline.length) return { score: 0, status: 'dormant', sampledAt: new Date().toISOString() };
+
+    const values = timeline.map(t => t.value?.[0] ?? 0);
+    const latest = values[values.length - 1];
+    const earlier = values.slice(0, Math.max(1, values.length - 2));
+    const earlierAvg = earlier.reduce((a, b) => a + b, 0) / earlier.length;
+    const peak = Math.max(...values);
+
+    let status = 'dormant';
+    if (latest >= peak * 0.85 && latest > earlierAvg * 1.2) status = 'rising';
+    else if (latest >= peak * 0.85) status = 'peaked';
+    else if (latest < earlierAvg * 0.6 && peak > 30) status = 'declining';
+    else if (latest < 10) status = 'dormant';
+    else status = 'peaked';
+
+    return {
+      score: latest,
+      peak,
+      status,
+      sampledAt: new Date().toISOString()
+    };
+  } catch (e) {
+    console.warn(`[Trends] "${keyword}" lookup failed:`, e.message);
+    return { score: null, status: 'unverified', sampledAt: new Date().toISOString() };
+  }
+}
+
+/**
+ * Extract a likely trend keyword from a headline.
+ * Prefers virus/disease/policy names; falls back to first proper noun.
+ */
+function extractTrendKeyword(headline) {
+  const knownDiseases = [
+    'hantavirus', 'nipah', 'norovirus', 'h5n1', 'avian flu', 'mpox', 'monkeypox',
+    'marburg', 'dengue', 'chikungunya', 'zika', 'covid', 'tuberculosis', 'tb',
+    'cancer', 'diabetes', 'cholera', 'measles', 'malaria'
+  ];
+  const lower = headline.toLowerCase();
+  const hit = knownDiseases.find(d => lower.includes(d));
+  if (hit) return hit;
+
+  // Fallback: first capitalised word longer than 4 chars
+  const match = headline.match(/\b[A-Z][a-zA-Z]{4,}\b/);
+  return match ? match[0].toLowerCase() : headline.split(' ').slice(0, 3).join(' ');
+}
+
 // =============== RANKING & DEDUP ===============
 function isIndiaRelevant(item) {
   const text = `${item.headline} ${item.summary}`.toLowerCase();
-  // Indian govt sources are auto-relevant
-  if (['PIB Health', 'DD News Health', 'ICMR', 'MoHFW', 'CDSCO'].includes(item.source)) return true;
+  if (TRUSTED_SOURCE_NAMES.includes(item.source)) return true;
   return INDIA_KEYWORDS.some(k => text.includes(k));
 }
 
@@ -185,55 +263,210 @@ function rank(items) {
   return items
     .map(it => {
       const ageHours = (now - it.publishedAt.getTime()) / 36e5;
-      const recency = Math.max(0, 48 - ageHours) / 48; // newer = higher
+      const recency = Math.max(0, 48 - ageHours) / 48;
       const score = it.sourceWeight * 0.6 + recency * 4;
       return { ...it, score };
     })
     .sort((a, b) => b.score - a.score);
 }
 
+// =============== MASTER PROMPT (Apollo Hospitals brand lens) ===============
+const APOLLO_SYSTEM_PROMPT = `You are HealthcareBot, the editorial-and-marketing intelligence agent for Apollo Hospitals — India's largest private healthcare network. You report to Apollo's marketing department, and your job is to ensure Apollo is FIRST IN THE MARKET with credible, on-brand content the moment a health story breaks in India.
+
+You think like:
+- A senior health journalist (accuracy, sourcing, no hype)
+- A brand strategist for a hospital chain (Apollo's authority, trust, and clinical credibility must never be diluted)
+- A social-media editor who tracks what Indian readers are actually searching, sharing, and worrying about right now
+
+You will receive:
+1. A pre-ranked list of candidate stories from a whitelist of trusted Indian health sources (MoHFW, PIB, ICMR, AIIMS, CDSCO, NHA/ABDM, DD News Health, Medical Dialogues).
+2. A live Google Trends India signal attached to each story.
+3. Today's IST date.
+
+SELECTION PRIORITY (pick exactly 10, or fewer with explicit shortfall_reason):
+1. Active Indian outbreaks / health alerts (IDSP, state health depts, MoHFW advisories)
+2. Regulatory/policy actions affecting Indian patients (CDSCO, MoHFW guidelines, PMJAY, ABDM)
+3. Globally trending stories that Indian audiences are SEARCHING — even if no Indian case yet (trend.status=rising in India)
+4. Indian medical research / clinical breakthroughs (ICMR, AIIMS, IITs)
+5. Health-tech & digital health in India
+6. Public-health campaigns & seasonal alerts (dengue, monsoon, heatstroke, AQI)
+
+HARD FILTERS: India-relevant, ≤48h old (or still unfolding), credible whitelisted source, semantically deduplicated.
+
+TONE & BRAND GUARDRAILS (non-negotiable):
+- Apollo speaks with CALM CLINICAL AUTHORITY. Never alarmist.
+- No medical advice in content ideas beyond "consult a doctor / visit Apollo".
+- No competitor naming (Fortis, Max, Manipal, Medanta) unless story is genuinely about them — then factual & neutral.
+- No political framing on policy stories.
+- Sensitive topics (suicide, mental health, reproductive, terminal illness): follow WHO responsible-reporting guidelines, default to awareness + helpline + Apollo service line, never graphic detail.
+- The trend layer matters: if Indians are searching about a virus that has no Indian cases yet, Apollo's role is MYTH-BUSTING & CALM EXPLANATION, not amplification.
+
+OUTPUT: return ONLY valid JSON, no prose before or after, matching this exact shape:
+
+{
+  "generatedAt": "ISO-8601",
+  "shortfall_reason": null,
+  "updates": [
+    {
+      "id": 1,
+      "headline": "string, max 90 chars, no clickbait",
+      "summary": "2-3 sentence factual summary",
+      "url": "primary source URL",
+      "source": "PIB Health | MoHFW | ICMR | ...",
+      "corroboratingSources": ["WHO SEARO", "IDSP Bulletin"],
+      "category": "alert|policy|pharma|research|tech|public",
+      "catLabel": "Health Alert",
+      "time": "3h ago",
+      "verified": true,
+      "trend": {
+        "status": "rising|peaked|declining|dormant|unverified",
+        "google_trends_score": 0-100 or null,
+        "is_india_searching": true|false,
+        "sentiment_guess": "fear|curiosity|anger|informational|mixed",
+        "source_of_signal": "Google Trends India (7d) + source recency"
+      },
+      "apolloAngle": {
+        "relevance": "1 sentence on why this matters to an Apollo audience",
+        "brandPosition": "Reassurance|Authority/Explainer|Service-led|Awareness|Myth-bust",
+        "contentIdeas": [
+          {
+            "format": "Instagram carousel|Reel/Short|Long-form blog|LinkedIn post|WhatsApp broadcast|Press note",
+            "hook": "concrete headline/opening line",
+            "cta": "concrete CTA",
+            "spokesperson": "suggested Apollo specialty + city, or null",
+            "speed": "publish within 24h|48h|72h"
+          }
+        ],
+        "riskNotes": "what NOT to do with this story"
+      }
+    }
+  ]
+}
+
+SELF-CHECK BEFORE RETURNING:
+- Exactly 10 items (or fewer + shortfall_reason)
+- At least 6 India-primary; up to 4 global-with-Indian-search-demand
+- No duplicate underlying events
+- Every contentIdeas array has 2-4 ideas across 2+ formats
+- No guardrail violations
+- Return ONLY the JSON object, nothing else.`;
+
+// =============== LLM ENRICHMENT ===============
+async function enrichWithApolloLens(candidates) {
+  if (!anthropic) {
+    console.warn('[LLM] ANTHROPIC_API_KEY missing — returning candidates without Apollo angles.');
+    return {
+      generatedAt: new Date().toISOString(),
+      shortfall_reason: 'LLM not configured',
+      updates: candidates.slice(0, 10).map((c, i) => ({
+        id: i + 1,
+        headline: c.headline,
+        summary: c.summary,
+        url: c.url,
+        source: c.source,
+        category: c.category,
+        catLabel: classify(`${c.headline} ${c.summary}`).label,
+        time: timeAgo(c.publishedAt),
+        verified: TRUSTED_SOURCE_NAMES.includes(c.source),
+        trend: c.trend || { status: 'unverified', google_trends_score: null },
+        apolloAngle: null
+      }))
+    };
+  }
+
+  const userPayload = {
+    today_ist: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+    candidates: candidates.slice(0, 25).map((c, i) => ({
+      idx: i,
+      headline: c.headline,
+      summary: c.summary,
+      url: c.url,
+      source: c.source,
+      category: c.category,
+      time: timeAgo(c.publishedAt),
+      trend: c.trend
+    }))
+  };
+
+  try {
+    const response = await anthropic.messages.create({
+      model: 'claude-opus-4-7',
+      max_tokens: 8000,
+      system: APOLLO_SYSTEM_PROMPT,
+      messages: [{
+        role: 'user',
+        content: `Today is ${userPayload.today_ist}.\n\nCandidate stories (already filtered to India-relevant, deduplicated, and ranked, with live Google Trends India signals attached):\n\n${JSON.stringify(userPayload.candidates, null, 2)}\n\nProduce today's Apollo Hospitals Daily India Health Briefing per the system specification. Return ONLY the JSON object.`
+      }]
+    });
+
+    const text = response.content
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('');
+
+    const cleaned = text.replace(/```json\s*/g, '').replace(/```\s*$/g, '').trim();
+    return JSON.parse(cleaned);
+  } catch (e) {
+    console.error('[LLM] Apollo-lens enrichment failed:', e.message);
+    return {
+      generatedAt: new Date().toISOString(),
+      shortfall_reason: `LLM error: ${e.message}`,
+      updates: candidates.slice(0, 10).map((c, i) => ({
+        id: i + 1,
+        headline: c.headline,
+        summary: c.summary,
+        url: c.url,
+        source: c.source,
+        category: c.category,
+        catLabel: classify(`${c.headline} ${c.summary}`).label,
+        time: timeAgo(c.publishedAt),
+        verified: TRUSTED_SOURCE_NAMES.includes(c.source),
+        trend: c.trend || { status: 'unverified' },
+        apolloAngle: null
+      }))
+    };
+  }
+}
+
 // =============== MAIN PIPELINE ===============
 async function buildDailyBriefing() {
-  console.log(`\n[${new Date().toISOString()}] Building daily briefing...`);
+  console.log(`\n[${new Date().toISOString()}] Building Apollo daily briefing...`);
   const all = [];
 
+  // 1. Fetch from all whitelisted sources
   for (const src of SOURCES) {
     const items = src.type === 'rss' ? await fetchRSS(src) : await fetchScrape(src);
     console.log(`  ${src.name}: ${items.length} items`);
     all.push(...items.map(i => ({ ...i, category: src.category })));
   }
 
-  // Filter, dedupe, rank
+  // 2. Filter + dedupe + rank
   const filtered = all.filter(isIndiaRelevant);
   const deduped = dedupe(filtered);
   const ranked = rank(deduped);
-  const top10 = ranked.slice(0, 10);
+  const top25 = ranked.slice(0, 25); // send a wider pool to the LLM for selection
 
-  // Re-classify each for the UI badge
-  const final = top10.map((it, i) => {
-    const cls = classify(`${it.headline} ${it.summary}`);
-    return {
-      id: i + 1,
-      headline: it.headline,
-      summary: it.summary,
-      url: it.url,
-      source: it.source,
-      category: cls.cat,
-      catLabel: cls.label,
-      time: timeAgo(it.publishedAt)
-    };
-  });
+  // 3. Attach live Google Trends India signal to each
+  console.log(`  Fetching Google Trends India for ${top25.length} candidates...`);
+  for (const item of top25) {
+    const kw = extractTrendKeyword(item.headline);
+    item.trend = await fetchGoogleTrendIndia(kw);
+    item.trend.keyword_used = kw;
+    item.trend.is_india_searching = (item.trend.score ?? 0) > 15;
+    // small delay so we don't get rate-limited by Google
+    await new Promise(r => setTimeout(r, 350));
+  }
 
-  // Cache to disk
+  // 4. LLM enrichment with Apollo brand lens
+  const briefing = await enrichWithApolloLens(top25);
+
+  // 5. Cache
   const cachePath = path.join(__dirname, 'cache', 'briefing.json');
   await fs.mkdir(path.dirname(cachePath), { recursive: true });
-  await fs.writeFile(cachePath, JSON.stringify({
-    generatedAt: new Date().toISOString(),
-    updates: final
-  }, null, 2));
+  await fs.writeFile(cachePath, JSON.stringify(briefing, null, 2));
 
-  console.log(`✓ Briefing built — ${final.length} stories cached.`);
-  return final;
+  console.log(`✓ Briefing built — ${briefing.updates?.length || 0} stories cached.`);
+  return briefing;
 }
 
 function timeAgo(date) {
@@ -254,18 +487,26 @@ app.get('/api/today', async (req, res) => {
     const data = JSON.parse(await fs.readFile(cachePath, 'utf-8'));
     res.json(data);
   } catch {
-    // Cache miss → build now
-    const updates = await buildDailyBriefing();
-    res.json({ generatedAt: new Date().toISOString(), updates });
+    const briefing = await buildDailyBriefing();
+    res.json(briefing);
   }
 });
 
 app.get('/api/refresh', async (req, res) => {
-  const updates = await buildDailyBriefing();
-  res.json({ ok: true, count: updates.length });
+  try {
+    const briefing = await buildDailyBriefing();
+    res.json({ ok: true, count: briefing.updates?.length || 0, briefing });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', bot: 'HealthcareBot' }));
+app.get('/health', (req, res) => res.json({
+  status: 'ok',
+  bot: 'HealthcareBot',
+  version: '2.0',
+  llm: anthropic ? 'configured' : 'missing ANTHROPIC_API_KEY'
+}));
 
 // =============== CRON: daily at 06:30 IST = 01:00 UTC ===============
 cron.schedule('0 1 * * *', () => {
@@ -275,7 +516,7 @@ cron.schedule('0 1 * * *', () => {
 // Boot
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`HealthcareBot API running on :${PORT}`);
-  // Build initial briefing on startup if cache is stale/missing
+  console.log(`HealthcareBot v2 API running on :${PORT}`);
+  console.log(`LLM: ${anthropic ? '✓ Claude configured' : '✗ ANTHROPIC_API_KEY missing'}`);
   buildDailyBriefing().catch(console.error);
 });
